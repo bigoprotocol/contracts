@@ -1,6 +1,6 @@
 # bigo/contracts
 
-NEAR contracts for Bigo.
+NEAR contracts for Bigo protocol.
 
 Four crates in a Cargo workspace:
 
