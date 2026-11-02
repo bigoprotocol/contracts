@@ -2,7 +2,7 @@
 name = "squad"
 version = "0.1.0"
 edition = "2021"
-repository = "https://github.com/example/bigo"
+repository = "https://github.com/bigoprotocol/contracts"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

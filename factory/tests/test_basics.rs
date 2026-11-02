@@ -1,4 +1,4 @@
-use near_api::{NearToken, NearGas};
+use near_api::NearToken;
 use near_sdk::serde_json::json;
 
 async fn create_subaccount(
@@ -27,14 +27,11 @@ fn build_table() -> serde_json::Value {
 async fn test_basics_on(contract_wasm: Vec<u8>, crate_name: &str) -> testresult::TestResult<()> {
     let sandbox = near_sandbox::Sandbox::start_sandbox().await?;
     let network = near_api::NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
-
     let owner = create_subaccount(&sandbox, "owner.sandbox").await?;
     let contract_acc = create_subaccount(&sandbox, "contract.sandbox").await?.as_contract();
-
     let signer = near_api::Signer::from_secret_key(
         near_sandbox::config::DEFAULT_GENESIS_ACCOUNT_PRIVATE_KEY.parse().unwrap(),
     )?;
-
     let init_args = if crate_name == "machine" {
         let coin: near_api::AccountId = "coin.sandbox".parse().unwrap();
         json!({
@@ -47,7 +44,6 @@ async fn test_basics_on(contract_wasm: Vec<u8>, crate_name: &str) -> testresult:
     } else {
         json!({"owner": owner.account_id()})
     };
-
     near_api::Contract::deploy(contract_acc.account_id().clone())
         .use_code(contract_wasm)
         .with_init_call("new", init_args)?
@@ -55,14 +51,13 @@ async fn test_basics_on(contract_wasm: Vec<u8>, crate_name: &str) -> testresult:
         .send_to(&network)
         .await?
         .assert_success();
-
-    // view check
     let method = if crate_name == "machine" { "get_table_hash" } else { "get_owner" };
-    let _res = contract_acc
+    let _res: serde_json::Value = contract_acc
         .call_function(method, ())
         .read_only()
         .fetch_from(&network)
-        .await?;
+        .await?
+        .data;
     Ok(())
 }
 

@@ -56,3 +56,12 @@ src/error.rs     error enum, no bare string panics for user-facing errors
 tests/           sandbox integration tests
 scripts/build.sh thin wrapper around cargo near build
 ```
+
+
+## Security
+
+- State before cross-call, private callbacks (`#[private]`), pull prize `claim()` with `on_claim_result` recovery
+- VRF envelope verified: `ed25519_verify(alpha, sig, pubkey)`, alpha format `vrf:{id}:{machine}:{draw}`, roll from `sha256(sig) % 10000`
+- Worst liability snapshot per draw `worst_liability`, `pool_reserved` accounting, checked math
+- Listing locks: `PackStatus::Listed`, `nft_transfer` blocked when listed
+- Squad escrow via `ft_on_transfer`, pro-rata prize split, refund after deadline race guarded

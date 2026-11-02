@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use near_sdk::require;
 
 pub fn checked_add(a: u128, b: u128) -> u128 {

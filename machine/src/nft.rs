@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::{PackRecord, PackStatus};
 use near_sdk::AccountId;
 

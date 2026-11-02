@@ -98,16 +98,15 @@ impl Contract {
         let creator = env::predecessor_account_id();
         require!(!coin_name.is_empty(), "coin name empty");
         require!(coin_name.len() <= 32, "coin name too long");
+        require!(coin_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-'), "invalid coin chars");
+        require!(self.global_contract_hash.is_some(), "global hash not set - deploy machine contract first");
 
         if is_fan_coin {
             require!(
                 self.allowlist.get(&machine_account).is_some() || self.is_allowlisted(machine_account.clone()),
                 "fan coin not allowlisted"
             );
-            // For fan coin, we allow many machines per coin (anyone can open one)
-            // But for new-coin, one machine per coin
         } else {
-            // New-coin: check coin not already has machine
             let coin_id: AccountId = format!("{}.bigo.testnet", coin_name.to_lowercase()).parse().expect("invalid coin name");
             require!(
                 self.coin_to_machine.get(&coin_id).is_none(),
@@ -116,7 +115,7 @@ impl Contract {
         }
 
         let coin_id = if is_fan_coin {
-            machine_account.clone() // fan coin uses existing coin id as machine id for simplicity in this mock
+            machine_account.clone()
         } else {
             format!("{}.bigo.testnet", coin_name.to_lowercase()).parse().expect("invalid coin name")
         };
@@ -140,13 +139,11 @@ impl Contract {
         }
         self.machine_infos.insert(machine_account.clone(), info);
 
-        // Record global contract hash reference
-        require!(self.global_contract_hash.is_some(), "global hash not set - deploy machine contract first");
-
         machine_account.to_string()
     }
 
-    pub fn get_machines(&self, from_index: Option<u64>, limit: Option<u64>) -> Vec<AccountId> {
+
+        pub fn get_machines(&self, from_index: Option<u64>, limit: Option<u64>) -> Vec<AccountId> {
         let start = from_index.unwrap_or(0) as usize;
         let lim = limit.unwrap_or(50).min(100) as usize;
         self.machines.iter().skip(start).take(lim).cloned().collect()

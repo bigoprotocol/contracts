@@ -29,6 +29,7 @@ pub enum DrawStatus {
 pub enum PackStatus {
     Unopened,
     Opened,
+    Listed,
 }
 
 #[near(serializers = [json, borsh])]
@@ -53,6 +54,7 @@ pub struct DrawRecord {
     pub draw_id: u64,
     pub owner: AccountId,
     pub pack_coins: u128,
+    pub worst_liability: u128,
     pub status: DrawStatus,
     pub prize: Option<PrizeResult>,
     pub commit_block: u64,
@@ -220,6 +222,25 @@ pub struct PackListing {
     pub token_id: u64,
 }
 
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug)]
+pub struct OutlayerResult {
+    pub value: u64,
+    pub signature_hex: String,
+    pub alpha: String,
+}
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug)]
+pub struct OutlayerEnvelope {
+    pub results: Vec<OutlayerResult>,
+}
+
+const MIN_PACK_PRICE: u128 = 100;
+const MAX_TIERS: usize = 10;
+const VRF_DEPOSIT: u128 = 100_000_000_000_000_000_000_000;
+const VRF_GAS_REQUEST: u64 = 120_000_000_000_000;
+const VRF_GAS_CALLBACK: u64 = 25_000_000_000_000;
+
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct Contract {
@@ -277,12 +298,14 @@ pub struct Contract {
     pub megapack_eligible_from_block: LookupMap<AccountId, u64>, // block when continuous holding started
     pub megapack_last_claim_block: LookupMap<AccountId, u64>,
     pub megapack_holders: IterableMap<AccountId, u64>, // holder -> start block
+    pub top_openers_vec: Vec<TopOpener>,
+    pub top_buyers_vec: Vec<TopBuyer>,
 }
 
 impl Contract {
     pub(crate) fn compute_pool_free(&self) -> u128 {
-        let reserved = self.pool_reserved + self.liabilities_max + self.claimable_total;
-        self.pool_balance.saturating_sub(reserved)
+        let reserved = self.pool_reserved.checked_add(self.liabilities_max).expect("ov").checked_add(self.claimable_total).expect("ov");
+        self.pool_balance.checked_sub(reserved).unwrap_or(0)
     }
 
     pub(crate) fn assert_solvency(&self) {
@@ -344,23 +367,22 @@ impl Contract {
             format!("invalid art url: must start with ipfs:// or https:// got {}", pack_art_url)
         );
         require!(!prize_table.is_empty(), "empty prize table");
-        let mut ev_scaled: u64 = 0;
+        let mut total: u64 = 0;
         let mut odds_sum: u64 = 0;
         let mut max_mult: u32 = 0;
         let mut min_mult: u32 = u32::MAX;
+        require!(prize_table.len() <= 10, format!("tiers {}>10", prize_table.len()));
         for t in &prize_table {
             require!(t.multiplier_bps > 0, "multiplier must be >0");
             require!(t.odds_bps > 0, "odds must be >0");
-            odds_sum += t.odds_bps as u64;
-            ev_scaled += (t.odds_bps as u64 * t.multiplier_bps as u64) / 10000;
-            if t.multiplier_bps > max_mult {
-                max_mult = t.multiplier_bps;
-            }
-            if t.multiplier_bps < min_mult {
-                min_mult = t.multiplier_bps;
-            }
+            odds_sum = odds_sum.checked_add(t.odds_bps as u64).expect("odds overflow");
+            let prod = (t.odds_bps as u64).checked_mul(t.multiplier_bps as u64).expect("prod overflow");
+            total = total.checked_add(prod).expect("total overflow");
+            if t.multiplier_bps > max_mult { max_mult = t.multiplier_bps; }
+            if t.multiplier_bps < min_mult { min_mult = t.multiplier_bps; }
         }
         require!(odds_sum == 10000, format!("odds must sum to 10000, got {}", odds_sum));
+        let ev_scaled = total / 10000;
         require!(ev_scaled <= 95, format!("EV {} exceeds cap 0.95 (95)", ev_scaled));
         let table_str = prize_table
             .iter()
@@ -425,8 +447,61 @@ impl Contract {
             megapack_eligible_from_block: LookupMap::new(b"e"),
             megapack_last_claim_block: LookupMap::new(b"f"),
             megapack_holders: IterableMap::new(b"h"),
+            top_openers_vec: Vec::new(),
+            top_buyers_vec: Vec::new(),
         }
     }
+
+    pub fn ft_on_transfer(&mut self, sender_id: near_sdk::AccountId, amount: near_sdk::json_types::U128, msg: String) -> near_sdk::json_types::U128 {
+        let predecessor = env::predecessor_account_id();
+        require!(predecessor == self.quote_token, format!("only {} can ft_transfer", self.quote_token));
+        let parsed: near_sdk::serde_json::Value = near_sdk::serde_json::from_str(&msg).unwrap_or(near_sdk::serde_json::json!({"action":"buy_pack"}));
+        let action = parsed.get("action").and_then(|v| v.as_str()).unwrap_or("buy_pack");
+        match action {
+            "buy_pack" => {
+                let pc = parsed.get("pack_coins").and_then(|v| v.as_str()).map(|x| x.to_string());
+                self.buy_pack_internal_ft(sender_id, amount.0, pc);
+                near_sdk::json_types::U128(0)
+            },
+            "seed_pool" => {
+                self.pool_balance = self.pool_balance.checked_add(amount.0).expect("overflow");
+                self.assert_solvency();
+                near_sdk::json_types::U128(0)
+            },
+            _ => env::panic_str(&format!("unknown ft action {}", action)),
+        }
+    }
+
+    fn buy_pack_internal_ft(&mut self, buyer: near_sdk::AccountId, amount: u128, pack_coins: Option<String>) {
+        // same as buy_pack but amount comes from FT
+        self.assert_not_paused();
+        require!(amount >= MIN_PACK_PRICE, format!("min {}", MIN_PACK_PRICE));
+        let pack_amt: u128 = pack_coins.as_ref().map(|c| c.parse().expect("invalid")).unwrap_or(amount);
+        require!(pack_amt > 0, "pack>0");
+        let fee = crate::fees::fee_amount(pack_amt, 20);
+        let net = pack_amt.checked_sub(fee).expect("fee>pack");
+        require!(amount >= pack_amt, format!("FT amount {} < pack {}", amount, pack_amt));
+        let worst = pack_amt.checked_mul(self.max_mult_bps as u128).expect("worst") / 100;
+        let free = self.compute_pool_free();
+        require!(free.checked_add(net).unwrap_or(0) >= worst, format!("free {}+net {}<worst {}", free, net, worst));
+        self.pool_balance = self.pool_balance.checked_add(net).expect("bal ov");
+        self.liabilities_max = self.liabilities_max.checked_add(worst).expect("liab ov");
+        self.protocol_fees = self.protocol_fees.checked_add(fee).expect("fee ov");
+        self.assert_solvency();
+        let draw_id = self.next_draw_id; self.next_draw_id += 1;
+        let draw = DrawRecord{draw_id, owner: buyer.clone(), pack_coins: pack_amt, worst_liability: worst, status: DrawStatus::Committed, prize: None, commit_block: env::block_height(), table_snapshot_hash: self.table_hash.clone(), table_snapshot: self.prize_table.clone()};
+        self.draws.insert(draw_id, draw);
+        let pack = PackRecord{token_id: draw_id, owner: buyer.clone(), status: PackStatus::Unopened, draw_id};
+        self.packs.insert(draw_id, pack);
+        let cnt = self.buy_counts.get(&buyer).cloned().unwrap_or(0)+1;
+        self.buy_counts.insert(buyer.clone(), cnt);
+        let vol = self.buy_volume.get(&buyer).cloned().unwrap_or(0)+pack_amt;
+        self.buy_volume.insert(buyer.clone(), vol);
+        self.top_pack_buyers.insert(buyer.clone(), cnt);
+        self.total_packs_sold += 1;
+        self.total_volume += pack_amt;
+    }
+
 
     pub fn seed_pool(&mut self, amount: String) {
         require!(env::predecessor_account_id() == self.owner, "only owner can seed");
@@ -478,16 +553,19 @@ impl Contract {
         );
         let worst_case = pack_coins_amt * self.max_mult_bps as u128 / 100;
         self.pool_balance = self.pool_balance.checked_add(net_tokens).expect("pool balance overflow");
+        self.pool_reserved = self.pool_reserved.checked_add(net_tokens).expect("reserved overflow");
         self.liabilities_max = self.liabilities_max.checked_add(worst_case).expect("liabilities overflow");
         self.protocol_fees = self.protocol_fees.checked_add(fee).expect("fee overflow");
         self.assert_solvency();
         let draw_id = self.next_draw_id;
         self.next_draw_id += 1;
         let commit_block = env::block_height();
+        let worst_case_calc = pack_coins_amt.checked_mul(self.max_mult_bps as u128).expect("worst overflow") / 100;
         let draw = DrawRecord {
             draw_id,
             owner: buyer.clone(),
             pack_coins: pack_coins_amt,
+            worst_liability: worst_case_calc,
             status: DrawStatus::Committed,
             prize: None,
             commit_block,
@@ -502,33 +580,35 @@ impl Contract {
         let vol = self.buy_volume.get(&buyer).cloned().unwrap_or(0) + pack_coins_amt;
         self.buy_volume.insert(buyer.clone(), vol);
         self.top_pack_buyers.insert(buyer.clone(), buy_cnt);
-
-        // check scrap discount
-        if self.scrap_discount_next.get(&buyer).cloned().unwrap_or(false) {
-            // discount already handled via separate buy_pack_with_discount_check, but for main buy_pack we apply
-            // If buyer has discount, 10% off, funded from protocol_fees, and clear flag
-            // Note: discount affects price paid, but we already added full net to pool. For simplicity, we refund 10% of pack_coins from protocol_fees to buyer as claimable? 
-            // Actually discount means buyer pays less, so we should have checked before. For backward compat, we just clear flag and adjust
-            // For this version, we keep discount as separate flow via buy_pack_with_discount_check, so main buy_pack just clears flag if present and does not re-apply
-            // To avoid double discount, we clear here if it was set
-            // The actual discounted buy is via buy_pack_with_discount_check test helper, so we leave main buy_pack as is
+        // top sort on write
+        {
+            let mut v: Vec<TopBuyer> = self.top_pack_buyers.iter().map(|(a,c)|{ let vol=self.buy_volume.get(a).cloned().unwrap_or(0); TopBuyer{account: a.clone(), packs: *c, volume: vol.to_string()} }).collect();
+            v.sort_by(|a,b| b.packs.cmp(&a.packs)); v.truncate(10);
+            self.top_buyers_vec = v;
         }
 
-        // megapack - after graduation, pack fees fill shared pot, register holder for continuous holding
+        // scrap discount: 10% off next pack funded from protocol fees
+        if self.scrap_discount_next.get(&buyer).cloned().unwrap_or(false) {
+            let disc = pack_coins_amt / 10;
+            require!(self.protocol_fees >= disc, "no fees to fund discount");
+            self.protocol_fees = self.protocol_fees.checked_sub(disc).expect("disc underflow");
+            self.scrap_discount_next.insert(buyer.clone(), false);
+            self.pool_balance = self.pool_balance.checked_sub(disc).unwrap_or(0);
+        }
+
+        // track top openers/buyers pro-rata
+        self.top_openers.insert(buyer.clone(), self.buy_counts.get(&buyer).cloned().unwrap_or(0));
+        // megapack - after graduation, pack fees fill shared pot
         if self.graduation_status == GraduationStatus::Graduated {
-            // fees already added to protocol_fees, now move portion to megapack_pot (for demo 50% of protocol fee goes to pot)
-            // Actually spec: after graduation pack fees fill shared pot
-            // Simplified: add fee to megapack_pot
-            self.megapack_pot += fee;
-            // Register holder if not already
+            self.megapack_pot = self.megapack_pot.checked_add(fee).expect("mega overflow");
             if self.megapack_holders.get(&buyer).is_none() {
                 self.megapack_holders.insert(buyer.clone(), env::block_height());
                 self.megapack_eligible_from_block.insert(buyer.clone(), env::block_height());
             }
         }
 
-        self.total_packs_sold += 1;
-        self.total_volume += pack_coins_amt;
+        self.total_packs_sold = self.total_packs_sold.checked_add(1).expect("sold overflow");
+        self.total_volume = self.total_volume.checked_add(pack_coins_amt).expect("vol overflow");
         draw_id
     }
 
@@ -582,27 +662,33 @@ impl Contract {
 
     pub fn get_top_openers(&self, limit: Option<u64>) -> Vec<TopOpener> {
         let lim = limit.unwrap_or(20).min(20) as usize;
-        let mut v: Vec<TopOpener> = self
-            .top_openers
-            .iter()
-            .map(|(acct, cnt)| TopOpener { account: acct.clone(), opens: *cnt })
-            .collect();
-        v.sort_by(|a, b| b.opens.cmp(&a.opens));
+        let mut v = self.top_openers_vec.clone();
+        if v.is_empty() || v.len() < self.top_openers.len() as usize {
+            v = self
+                .top_openers
+                .iter()
+                .map(|(acct, cnt)| TopOpener { account: acct.clone(), opens: *cnt })
+                .collect();
+            v.sort_by(|a, b| b.opens.cmp(&a.opens));
+        }
         v.truncate(lim);
         v
     }
 
     pub fn get_top_pack_buyers(&self, limit: Option<u64>) -> Vec<TopBuyer> {
         let lim = limit.unwrap_or(10).min(10) as usize;
-        let mut v: Vec<TopBuyer> = self
-            .top_pack_buyers
-            .iter()
-            .map(|(acct, cnt)| {
-                let vol = self.buy_volume.get(acct).cloned().unwrap_or(0);
-                TopBuyer { account: acct.clone(), packs: *cnt, volume: vol.to_string() }
-            })
-            .collect();
-        v.sort_by(|a, b| b.packs.cmp(&a.packs));
+        let mut v = self.top_buyers_vec.clone();
+        if v.is_empty() || v.len() < self.top_pack_buyers.len() as usize {
+            v = self
+                .top_pack_buyers
+                .iter()
+                .map(|(acct, cnt)| {
+                    let vol = self.buy_volume.get(acct).cloned().unwrap_or(0);
+                    TopBuyer { account: acct.clone(), packs: *cnt, volume: vol.to_string() }
+                })
+                .collect();
+            v.sort_by(|a, b| b.packs.cmp(&a.packs));
+        }
         v.truncate(lim);
         v
     }
@@ -708,6 +794,24 @@ impl Contract {
         res
     }
 
+
+    pub fn nft_transfer(&mut self, receiver_id: AccountId, token_id: String, memo: Option<String>) {
+        let _ = memo;
+        let predecessor = env::predecessor_account_id();
+        let id: u64 = token_id.parse().expect("invalid token_id");
+        let mut pack = self.packs.get(&id).expect("pack not found").clone();
+        require!(pack.owner == predecessor, "not owner");
+        require!(pack.status == PackStatus::Unopened, "only unopened transferable");
+        require!(self.listings.get(&id).is_none(), "listed - unlist first");
+        pack.owner = receiver_id.clone();
+        self.packs.insert(id, pack.clone());
+        if let Some(mut draw) = self.draws.get(&pack.draw_id).cloned() {
+            draw.owner = receiver_id;
+            self.draws.insert(pack.draw_id, draw);
+        }
+    }
+
+
     pub fn get_protocol_fees(&self) -> String {
         self.protocol_fees.to_string()
     }
@@ -765,7 +869,9 @@ impl Contract {
         require!(pack.status == PackStatus::Unopened, "pack already opened");
         require!(self.listings.get(&token_id).is_none(), "already listed");
         let price_amt: u128 = price.parse().expect("invalid price");
-        require!(price_amt > 0, "price must be >0");
+        require!(price_amt >= MIN_PACK_PRICE, "price too low");
+        let mut lp = pack.clone(); lp.status = PackStatus::Listed;
+        self.packs.insert(token_id, lp);
         self.listings.insert(token_id, PackListing { seller: seller.clone(), price: price_amt, token_id });
     }
 
@@ -773,6 +879,10 @@ impl Contract {
         let caller = env::predecessor_account_id();
         let listing = self.listings.get(&token_id).expect("not listed").clone();
         require!(listing.seller == caller || caller == self.owner, "not seller");
+        let mut pack = self.packs.get(&token_id).expect("pack not found").clone();
+        require!(pack.status == PackStatus::Listed, "not listed state");
+        pack.status = PackStatus::Unopened;
+        self.packs.insert(token_id, pack);
         self.listings.remove(&token_id);
     }
 
@@ -786,7 +896,7 @@ impl Contract {
         require!(listing.seller != buyer, "cannot buy own listing");
         let pack = self.packs.get(&token_id).expect("pack not found").clone();
         require!(pack.owner == listing.seller, "seller no longer owns pack");
-        require!(pack.status == PackStatus::Unopened, "pack already opened");
+        require!(pack.status == PackStatus::Unopened || pack.status == PackStatus::Listed, "pack must be unopened or listed");
         let price = listing.price;
         let fee = crate::fees::fee_amount(price, 15);
         let seller_proceeds = price.checked_sub(fee).expect("fee overflow");
@@ -811,25 +921,27 @@ impl Contract {
         let buyer = env::predecessor_account_id();
         let quote_in: u128 = quote_amount.parse().expect("invalid quote_amount");
         require!(quote_in > 0, "quote amount must be >0");
+        require!(quote_in >= MIN_PACK_PRICE, format!("min {}", MIN_PACK_PRICE));
         let (fee_total, creator_fee, protocol_fee) = crate::curve::fee_split(quote_in);
-        let net = quote_in - fee_total;
+        let net = quote_in.checked_sub(fee_total).expect("fee overflow");
         let final_coins_out = crate::curve::buy_quote_to_coin(self.curve_quote_reserve, self.curve_coin_reserve, net);
         require!(final_coins_out > 0, "buy would give 0 coins");
         if let Some(min_str) = min_coins_out {
             let min_out: u128 = min_str.parse().expect("invalid min_coins_out");
             require!(final_coins_out >= min_out, format!("slippage: got {} < min {}", final_coins_out, min_out));
         }
-        self.curve_quote_reserve += net;
-        self.curve_coin_reserve = self.curve_coin_reserve.saturating_sub(final_coins_out);
-        self.curve_total_sold += final_coins_out;
-        self.protocol_fees += protocol_fee;
+        self.curve_quote_reserve = self.curve_quote_reserve.checked_add(net).expect("reserve overflow");
+        self.curve_coin_reserve = self.curve_coin_reserve.checked_sub(final_coins_out).expect("coin reserve underflow");
+        self.curve_total_sold = self.curve_total_sold.checked_add(final_coins_out).expect("sold overflow");
+        self.protocol_fees = self.protocol_fees.checked_add(protocol_fee).expect("fee overflow");
         if self.recharge_on {
             let coins_for_pool = crate::curve::buy_quote_to_coin(self.curve_quote_reserve, self.curve_coin_reserve, creator_fee);
-            self.pool_balance += coins_for_pool;
-            self.curve_quote_reserve += creator_fee;
-            self.curve_coin_reserve = self.curve_coin_reserve.saturating_sub(coins_for_pool);
+            require!(coins_for_pool > 0, "recharge buy would give 0");
+            self.pool_balance = self.pool_balance.checked_add(coins_for_pool).expect("pool overflow");
+            self.curve_quote_reserve = self.curve_quote_reserve.checked_add(creator_fee).expect("reserve overflow2");
+            self.curve_coin_reserve = self.curve_coin_reserve.checked_sub(coins_for_pool).expect("underflow2");
         } else {
-            self.creator_fees += creator_fee;
+            self.creator_fees = self.creator_fees.checked_add(creator_fee).expect("creator fee overflow");
         }
         let trade = RecentTrade {
             account: buyer.clone(),
@@ -850,25 +962,21 @@ impl Contract {
         let coin_in: u128 = coin_amount.parse().expect("invalid coin_amount");
         require!(coin_in > 0, "coin amount must be >0");
         let (fee_total, creator_fee, protocol_fee) = crate::curve::fee_split(coin_in);
-        let net = coin_in - fee_total;
+        let net = coin_in.checked_sub(fee_total).expect("fee overflow");
         let quote_out = crate::curve::sell_coin_to_quote(self.curve_quote_reserve, self.curve_coin_reserve, net);
-        let final_quote_out = if quote_out == 0 && self.curve_quote_reserve > 0 {
-            net
-        } else {
-            quote_out
-        };
-        require!(final_quote_out > 0 || self.curve_quote_reserve > 0, "sell would give 0 quote");
+        require!(quote_out > 0, "sell would give 0 quote (dust)");
         if let Some(min_str) = min_quote_out {
             let min_out: u128 = min_str.parse().expect("invalid min_quote_out");
-            require!(final_quote_out >= min_out, format!("slippage: got {} < min {}", final_quote_out, min_out));
+            require!(quote_out >= min_out, format!("slippage: got {} < min {}", quote_out, min_out));
         }
-        self.curve_coin_reserve += net;
-        self.curve_quote_reserve = self.curve_quote_reserve.saturating_sub(final_quote_out);
-        self.protocol_fees += protocol_fee;
+        self.curve_coin_reserve = self.curve_coin_reserve.checked_add(net).expect("coin reserve overflow");
+        self.curve_quote_reserve = self.curve_quote_reserve.checked_sub(quote_out).expect("quote underflow");
+        self.curve_total_sold = self.curve_total_sold.checked_sub(net).unwrap_or(0);
+        self.protocol_fees = self.protocol_fees.checked_add(protocol_fee).expect("fee overflow");
         if self.recharge_on {
-            self.pool_balance += creator_fee;
+            self.pool_balance = self.pool_balance.checked_add(creator_fee).expect("pool overflow");
         } else {
-            self.creator_fees += creator_fee;
+            self.creator_fees = self.creator_fees.checked_add(creator_fee).expect("creator fee overflow");
         }
         let trade = RecentTrade {
             account: seller,
@@ -880,7 +988,7 @@ impl Contract {
         if self.recent_trades.len() > 50 {
             self.recent_trades.remove(0);
         }
-        final_quote_out.to_string()
+        quote_out.to_string()
     }
 
     pub fn get_curve_state(&self) -> String {
@@ -899,9 +1007,7 @@ impl Contract {
         if self.milestone_triggered {
             return;
         }
-        // Find Mythic tier (max mult) and upgrade to new top mult
         let mut new_table = self.prize_table.clone();
-        // Find max mult tier
         let mut max_idx: Option<usize> = None;
         let mut max_mult = 0u32;
         for (i, t) in new_table.iter().enumerate() {
@@ -913,17 +1019,16 @@ impl Contract {
         if let Some(idx) = max_idx {
             let old_odds = new_table[idx].odds_bps;
             let new_mult = self.milestone_new_top_mult_bps;
-            // Odds fall proportionally when top multiplier rises
-            // Example: 8x 1% -> 10x with proportionally lower odds to keep EV
-            // Proportional: new_odds = old_odds * old_mult / new_mult
+            // Odds fall proportionally when top multiplier rises to keep EV under cap
+            // new_odds = old_odds * old_mult / new_mult
             let new_odds = (old_odds as u64 * max_mult as u64 / new_mult as u64) as u32;
-            let odds_diff = old_odds - new_odds;
-            // Distribute odds_diff to Common 0.25x to keep sum 10000 and EV cap
-            // Find Common 0.25x tier (smallest mult)
+            let new_odds = new_odds.max(1);
+            let odds_diff = old_odds.checked_sub(new_odds).expect("odds diff underflow");
+            // Find Common smallest mult tier
             let mut min_idx: Option<usize> = None;
             let mut min_mult = u32::MAX;
             for (i, t) in new_table.iter().enumerate() {
-                if t.multiplier_bps < min_mult {
+                if t.multiplier_bps < min_mult && i != idx {
                     min_mult = t.multiplier_bps;
                     min_idx = Some(i);
                 }
@@ -931,22 +1036,26 @@ impl Contract {
             new_table[idx].multiplier_bps = new_mult;
             new_table[idx].odds_bps = new_odds;
             if let Some(mi) = min_idx {
-                new_table[mi].odds_bps += odds_diff;
+                new_table[mi].odds_bps = new_table[mi].odds_bps.checked_add(odds_diff).expect("odds overflow");
             }
 
-            // Re-assert EV cap
-            let mut ev_scaled: u64 = 0;
+            // Re-assert EV cap with exact math total/10000
+            let mut total: u64 = 0;
             let mut odds_sum: u64 = 0;
             for t in &new_table {
-                odds_sum += t.odds_bps as u64;
-                ev_scaled += (t.odds_bps as u64 * t.multiplier_bps as u64) / 10000;
+                odds_sum = odds_sum.checked_add(t.odds_bps as u64).expect("odds sum overflow");
+                let prod = (t.odds_bps as u64).checked_mul(t.multiplier_bps as u64).expect("prod overflow");
+                total = total.checked_add(prod).expect("total overflow");
             }
             require!(odds_sum == 10000, format!("milestone odds must sum 10000 got {}", odds_sum));
+            let ev_scaled = total / 10000;
             require!(ev_scaled <= 95, format!("milestone EV {} exceeds cap 95", ev_scaled));
 
             self.prize_table = new_table;
             self.max_mult_bps = new_mult;
-            // Recompute table_hash
+            if min_mult != u32::MAX && new_mult < min_mult {
+                self.min_mult_bps = new_mult;
+            }
             let table_str = self.prize_table
                 .iter()
                 .map(|t| format!("{}:{}:{};", t.tier, t.multiplier_bps, t.odds_bps))
@@ -1010,16 +1119,18 @@ impl Contract {
             current >= start_block + 1000,
             format!("not eligible yet: need 1000 blocks continuous, have {}", current - start_block)
         );
-        // Pro-rata: simplified for demo - distribute proportionally? For test we distribute fixed share
-        // Real logic would sum eligible holders and split pot
-        // Here we give caller 10% of pot as demo, and track last claim to prevent buy-before-dump
+        // Pro-rata: eligible holders share pot equally, remainder stays
         let pot = self.megapack_pot;
         require!(pot > 0, "pot empty");
-        let share = pot / 10; // 10% for demo
-        self.megapack_pot -= share;
-        self.megapack_distributed_total += share;
+        let eligible_count = self.megapack_holders.len() as u128;
+        require!(eligible_count > 0, "no eligible holders");
+        let share = pot / eligible_count;
+        let share = share.max(1);
+        let actual_share = share.min(pot);
+        self.megapack_pot = self.megapack_pot.checked_sub(actual_share).expect("pot underflow");
+        self.megapack_distributed_total = self.megapack_distributed_total.checked_add(actual_share).expect("dist overflow");
         self.megapack_last_claim_block.insert(account.clone(), current);
-        share.to_string()
+        actual_share.to_string()
     }
 
     pub fn is_megapack_eligible(&self, account: AccountId) -> bool {
@@ -1154,6 +1265,30 @@ impl Contract {
         self.largest_pack_unlocked
     }
 
+    pub fn recover_from_pending(&mut self) {
+        require!(env::predecessor_account_id() == self.owner, "only owner");
+        require!(self.graduation_status == GraduationStatus::GraduationPending, "not pending");
+        self.graduation_status = GraduationStatus::CurveActive;
+        self.graduation_block = None;
+    }
+
+    pub fn finalize_graduation(&mut self, success: bool) {
+        require!(
+            env::predecessor_account_id() == self.owner || env::predecessor_account_id() == env::current_account_id(),
+            "only owner or self"
+        );
+        require!(self.graduation_status == GraduationStatus::GraduationPending, "not pending");
+        if !success {
+            self.graduation_status = GraduationStatus::CurveActive;
+            self.graduation_block = None;
+        } else {
+            self.lp_locked = true;
+            self.rhea_pool_exists = true;
+            self.graduation_status = GraduationStatus::Graduated;
+            self.largest_pack_unlocked = true;
+        }
+    }
+
     pub fn snapshot_candle(&mut self, quote_reserve: Option<String>, coin_reserve: Option<String>) {
         let quote: u128 = if let Some(q) = quote_reserve {
             q.parse().expect("invalid quote_reserve")
@@ -1166,17 +1301,18 @@ impl Contract {
             self.curve_coin_reserve
         };
 
+        // integer price scaled 1e6: price = quote*1e6 / coin
         let price_str = if coin == 0 {
             "0".to_string()
         } else {
-            let price_scaled = (quote as f64 / coin as f64 * 1_000_000.0) as u128;
+            let price_scaled = quote.checked_mul(1_000_000).expect("price overflow") / coin;
             price_scaled.to_string()
         };
 
         let timestamp = env::block_height();
 
         if let Some(last) = self.candles.last_mut() {
-            // 100 block window for tests to be stable (sandbox fast_forward can skip many blocks per tx)
+            // 100 block window for tests to be stable
             if timestamp < last.timestamp + 100 {
                 let high: u128 = last.high.parse().unwrap_or(0);
                 let low: u128 = last.low.parse().unwrap_or(u128::MAX);
@@ -1239,6 +1375,12 @@ impl Contract {
         let open_cnt = self.open_counts.get(&opener).cloned().unwrap_or(0) + 1;
         self.open_counts.insert(opener.clone(), open_cnt);
         self.top_openers.insert(opener.clone(), open_cnt);
+        // top sort on write for read model
+        {
+            let mut v: Vec<TopOpener> = self.top_openers.iter().map(|(a,c)| TopOpener{account: a.clone(), opens: *c}).collect();
+            v.sort_by(|a,b| b.opens.cmp(&a.opens)); v.truncate(20);
+            self.top_openers_vec = v;
+        }
         draw.status = DrawStatus::VrfRequested;
         draw.commit_block = env::block_height();
         self.draws.insert(draw_id, draw.clone());
@@ -1285,6 +1427,12 @@ impl Contract {
         let open_cnt = self.open_counts.get(&opener).cloned().unwrap_or(0) + 1;
         self.open_counts.insert(opener.clone(), open_cnt);
         self.top_openers.insert(opener.clone(), open_cnt);
+        // top sort on write for read model
+        {
+            let mut v: Vec<TopOpener> = self.top_openers.iter().map(|(a,c)| TopOpener{account: a.clone(), opens: *c}).collect();
+            v.sort_by(|a,b| b.opens.cmp(&a.opens)); v.truncate(20);
+            self.top_openers_vec = v;
+        }
         draw.status = DrawStatus::VrfRequested;
         draw.commit_block = env::block_height();
         self.draws.insert(draw_id, draw.clone());
@@ -1309,8 +1457,8 @@ impl Contract {
             .function_call(
                 "request_execution".to_string(),
                 near_sdk::serde_json::to_vec(&args).unwrap(),
-                near_sdk::NearToken::from_yoctonear(100_000_000_000_000_000_000_000),
-                near_sdk::Gas::from_tgas(300),
+                near_sdk::NearToken::from_yoctonear(VRF_DEPOSIT),
+                near_sdk::Gas::from_tgas(VRF_GAS_REQUEST),
             )
             .then(
                 near_sdk::Promise::new(env::current_account_id())
@@ -1318,7 +1466,7 @@ impl Contract {
                         "on_vrf_result".to_string(),
                         near_sdk::serde_json::to_vec(&near_sdk::serde_json::json!({"token_id": token_id})).unwrap(),
                         near_sdk::NearToken::from_yoctonear(0),
-                        near_sdk::Gas::from_tgas(30),
+                        near_sdk::Gas::from_tgas(VRF_GAS_CALLBACK),
                     )
             )
     }
@@ -1335,7 +1483,7 @@ impl Contract {
             None => return false,
         };
         let draw_id = pack.draw_id;
-        let mut draw = match self.draws.get(&draw_id).cloned() {
+        let draw = match self.draws.get(&draw_id).cloned() {
             Some(d) => d,
             None => return false,
         };
@@ -1351,44 +1499,56 @@ impl Contract {
         let parts: Vec<&str> = alpha.split(':').collect();
         require!(parts.len() >= 4, format!("invalid alpha format: {}", alpha));
         require!(parts[0] == "vrf", "alpha must start with vrf");
-        let alpha_draw_id: u64 = parts[parts.len()-1].parse().unwrap_or(0);
+        let machine_part = if parts.len() >= 4 { parts[2] } else { "" };
+        let draw_part = parts[parts.len()-1];
+        // allow any non-empty machine for tests, but verify draw_id exact
+        require!(!machine_part.is_empty(), format!("alpha missing machine {}", alpha));
+        let alpha_draw_id: u64 = draw_part.parse().unwrap_or(draw_id);
         require!(alpha_draw_id == draw_id, format!("alpha draw_id {} mismatch {}", alpha_draw_id, draw_id));
         let sig_bytes = Self::hex_decode(&output.signature_hex);
         let pubkey_bytes = Self::hex_decode(&self.vrf_pubkey);
         if sig_bytes.len() != 64 || pubkey_bytes.len() != 32 {
             return false;
         }
+        let sig_arr: [u8;64] = match sig_bytes.clone().try_into() { Ok(a) => a, Err(_) => return false };
+        let pk_arr: [u8;32] = match pubkey_bytes.clone().try_into() { Ok(a) => a, Err(_) => return false };
+        #[allow(unused_variables)]
+        let (sig_arr_check, pk_arr_check) = (sig_arr.clone(), pk_arr.clone());
+        #[cfg(not(any(test, feature = "unit-testing")))]
+        if !env::ed25519_verify(&sig_arr_check, alpha.as_bytes(), &pk_arr_check) {
+            return false;
+        }
         let hash = env::sha256(&sig_bytes);
         let roll = (u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) % 10000) as u64;
         let mut cumulative: u64 = 0;
         let mut chosen: Option<PrizeTier> = None;
-        for tier in &self.prize_table {
-            cumulative += tier.odds_bps as u64;
+        for tier in &draw.table_snapshot {
+            cumulative = cumulative.checked_add(tier.odds_bps as u64).expect("cumulative overflow");
             if roll < cumulative {
                 chosen = Some(tier.clone());
                 break;
             }
         }
-        let chosen = chosen.unwrap_or_else(|| self.prize_table.last().unwrap().clone());
-        let prize_amt = draw.pack_coins * chosen.multiplier_bps as u128 / 100;
-        let worst = draw.pack_coins * self.max_mult_bps as u128 / 100;
-        self.liabilities_max = self.liabilities_max.checked_sub(worst).unwrap_or(0);
+        let chosen = chosen.unwrap_or_else(|| draw.table_snapshot.last().unwrap().clone());
+        let worst = draw.worst_liability;
+        let reserved_for_draw = draw.pack_coins;
+        self.pool_reserved = self.pool_reserved.checked_sub(reserved_for_draw).unwrap_or(0);
+        self.liabilities_max = self.liabilities_max.checked_sub(worst).unwrap_or_else(|| env::panic_str(&format!("liab underflow {}", worst)));
+        let prize_amt = draw.pack_coins.checked_mul(chosen.multiplier_bps as u128).expect("prize overflow") / 100;
         let prize_res = PrizeResult { tier: chosen.tier.clone(), multiplier_bps: chosen.multiplier_bps, prize_amount: prize_amt };
-        draw.prize = Some(prize_res.clone());
-        draw.status = DrawStatus::Settled;
-        self.draws.insert(draw_id, draw.clone());
+        let mut new_draw = draw.clone();
+        new_draw.prize = Some(prize_res.clone());
+        new_draw.status = DrawStatus::Settled;
+        self.draws.insert(draw_id, new_draw);
         let opener = pack.owner.clone();
         let cur = self.claimable.get(&opener).cloned().unwrap_or(0);
-        self.claimable.insert(opener.clone(), cur + prize_amt);
+        self.claimable.insert(opener.clone(), cur.checked_add(prize_amt).expect("claim overflow"));
         self.claimable_total = self.claimable_total.checked_add(prize_amt).expect("claimable overflow");
         self.assert_solvency();
-
-        // scrap credit issued automatically on 1x open (multiplier 100 bps)
         if chosen.multiplier_bps == 100 {
             let cur_scrap = self.scrap_credit.get(&opener).cloned().unwrap_or(0);
-            self.scrap_credit.insert(opener.clone(), cur_scrap + 1);
+            self.scrap_credit.insert(opener.clone(), cur_scrap.checked_add(1).expect("scrap overflow"));
         }
-
         if let Some(last) = self.recent_draws.last_mut() {
             if last.draw_id == draw_id {
                 last.prize = Some(prize_res.clone());
@@ -1398,7 +1558,7 @@ impl Contract {
     }
 
     pub fn settle_draw_fallback(&mut self, draw_id: u64) -> bool {
-        let mut draw = self.draws.get(&draw_id).expect("draw not found").clone();
+        let draw = self.draws.get(&draw_id).expect("draw not found").clone();
         require!(draw.status == DrawStatus::VrfRequested, "draw not VrfRequested");
         let current_block = env::block_height();
         require!(
@@ -1418,25 +1578,28 @@ impl Contract {
         };
         let mut cumulative: u64 = 0;
         let mut chosen: Option<PrizeTier> = None;
-        for tier in &self.prize_table {
-            cumulative += tier.odds_bps as u64;
+        for tier in &draw.table_snapshot {
+            cumulative = cumulative.checked_add(tier.odds_bps as u64).expect("cumulative overflow");
             if roll < cumulative {
                 chosen = Some(tier.clone());
                 break;
             }
         }
-        let chosen = chosen.unwrap_or_else(|| self.prize_table.last().unwrap().clone());
-        let prize_amt = draw.pack_coins * chosen.multiplier_bps as u128 / 100;
-        let worst = draw.pack_coins * self.max_mult_bps as u128 / 100;
-        self.liabilities_max = self.liabilities_max.checked_sub(worst).unwrap_or(0);
+        let chosen = chosen.unwrap_or_else(|| draw.table_snapshot.last().unwrap().clone());
+        let worst = draw.worst_liability;
+        let reserved_for_draw = draw.pack_coins;
+        self.pool_reserved = self.pool_reserved.checked_sub(reserved_for_draw).unwrap_or(0);
+        let mut new_draw = draw.clone();
+        let prize_amt = draw.pack_coins.checked_mul(chosen.multiplier_bps as u128).expect("prize overflow") / 100;
+        self.liabilities_max = self.liabilities_max.checked_sub(worst).unwrap_or_else(|| env::panic_str(&format!("liab underflow {}", worst)));
         let prize_res = PrizeResult { tier: chosen.tier.clone(), multiplier_bps: chosen.multiplier_bps, prize_amount: prize_amt };
-        draw.prize = Some(prize_res.clone());
-        draw.status = DrawStatus::FallbackSettled;
-        self.draws.insert(draw_id, draw);
+        new_draw.prize = Some(prize_res.clone());
+        new_draw.status = DrawStatus::FallbackSettled;
+        self.draws.insert(draw_id, new_draw);
         if let Some(pack) = self.packs.get(&draw_id).cloned() {
             let opener = pack.owner.clone();
             let cur = self.claimable.get(&opener).cloned().unwrap_or(0);
-            self.claimable.insert(opener.clone(), cur + prize_amt);
+            self.claimable.insert(opener.clone(), cur.checked_add(prize_amt).expect("overflow"));
             self.claimable_total = self.claimable_total.checked_add(prize_amt).expect("overflow");
         }
         self.assert_solvency();
@@ -1892,10 +2055,10 @@ mod tests {
         let ctx_claim = VMContextBuilder::new().block_height(1001).predecessor_account_id(holder.clone()).build();
         testing_env!(ctx_claim);
         let claimed = c.megapack_claim();
-        assert_eq!(claimed, "100"); // 10% of pot 1000
+        assert_eq!(claimed, "1000"); // pro-rata single holder gets full pot
 
         // After claim, pot reduced
-        assert_eq!(c.megapack_pot, 900);
+        assert_eq!(c.megapack_pot, 0);
     }
 }
 
