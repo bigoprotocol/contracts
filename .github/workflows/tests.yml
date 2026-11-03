@@ -1,0 +1,107 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+  pull_request:
+    branches:
+      - main
+      - develop
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bigo-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust-checks:
+    name: Rust Checks & Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bigo-rust
+
+      # Install depedencies
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            clang \
+            cmake
+
+      # Formatting
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Compilation
+      - name: Cargo Check
+        run: cargo check --workspace --all-targets
+
+      # Run Clippy
+      - name: Run Clippy
+        run: |
+          cargo clippy \
+            --workspace \
+            --all-targets \
+            -- -D warnings
+
+      # Run all tests
+      - name: Run Tests
+        run: cargo test --workspace --all-targets
+
+      # Build contracts
+      - name: Build Contracts
+        run: |
+          cargo build \
+            --workspace \
+            --release \
+            --target wasm32-unknown-unknown
+
+      # Verify
+      - name: Verify artifacts
+        run: |
+          echo "Checking WASM files..."
+
+          find target/wasm32-unknown-unknown/release \
+            -maxdepth 1 \
+            -name "*.wasm" \
+            -type f
+
+          WASM_COUNT=$(find target/wasm32-unknown-unknown/release \
+            -maxdepth 1 \
+            -name "*.wasm" \
+            -type f | wc -l)
+
+          if [ "$WASM_COUNT" -eq 0 ]; then
+            echo "ERROR: No WASM artifacts generated!"
+            exit 1
+          fi
+
+          echo "$WASM_COUNT WASM files found!"
