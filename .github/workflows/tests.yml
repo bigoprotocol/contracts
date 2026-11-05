@@ -54,7 +54,12 @@ jobs:
             pkg-config \
             libssl-dev \
             clang \
+            curl \
             cmake
+
+      # Install Near CLI
+      - name: Install near-cli
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/near/near-cli-rs/releases/latest/download/near-cli-rs-installer.sh | sh
 
       # Formatting
       - name: Check formatting
