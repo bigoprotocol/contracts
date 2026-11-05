@@ -53,6 +53,7 @@ jobs:
             build-essential \
             pkg-config \
             libssl-dev \
+            libudev-dev \
             clang \
             curl \
             cmake
@@ -60,6 +61,10 @@ jobs:
       # Install Near CLI
       - name: Install near-cli
         run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/near/near-cli-rs/releases/latest/download/near-cli-rs-installer.sh | sh
+
+      # Install cargo-near
+      - name: Install cargo-near
+        run: cargo install --locked cargo-near
 
       # Formatting
       - name: Check formatting
