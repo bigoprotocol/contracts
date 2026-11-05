@@ -1,0 +1,12 @@
+[package]
+name = "mock-rhea"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "=5.29.0"
+
+[workspace]

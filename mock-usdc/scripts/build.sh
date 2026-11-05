@@ -2,4 +2,4 @@
 set -e
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
-cargo near build --release --no-locked
+cargo near build non-reproducible-wasm

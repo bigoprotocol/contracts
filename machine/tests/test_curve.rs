@@ -1,247 +1,315 @@
-use near_api::NearToken;
-use near_api::NearGas;
+mod common;
+
+use common::*;
 use near_sdk::serde_json::json;
 
-async fn create_subaccount(
+const VRF_PUBKEY: &str = "c0c5aeae1688c2f7cc2350aae1ee3ce96eddc0de84d678db873de48268f8cfa8";
+
+async fn setup(
     sandbox: &near_sandbox::Sandbox,
+    network: &near_api::NetworkConfig,
     name: &str,
-) -> testresult::TestResult<near_api::Account> {
-    let account_id: near_api::AccountId = name.parse().unwrap();
-    sandbox
-        .create_account(account_id.clone())
-        .initial_balance(NearToken::from_near(1000))
-        .send()
-        .await?;
-    Ok(near_api::Account(account_id))
-}
-
-fn good_table() -> serde_json::Value {
-    json!([
-        {"multiplier_bps": 25, "odds_bps": 6000, "tier": "Common"},
-        {"multiplier_bps": 100, "odds_bps": 2500, "tier": "Common"},
-        {"multiplier_bps": 200, "odds_bps": 1000, "tier": "Rare"},
-        {"multiplier_bps": 400, "odds_bps": 400, "tier": "Epic"},
-        {"multiplier_bps": 800, "odds_bps": 100, "tier": "Mythic"}
-    ])
-}
-
-fn genesis_signer() -> std::sync::Arc<near_api::Signer> {
-    near_api::Signer::from_secret_key(
-        near_sandbox::config::DEFAULT_GENESIS_ACCOUNT_PRIVATE_KEY.parse().unwrap(),
+) -> testresult::TestResult<(
+    near_api::Account,
+    near_api::Account,
+    near_api::Contract,
+    near_api::Contract,
+    near_api::Contract,
+)> {
+    let owner = create_subaccount(sandbox, "owner.sandbox").await?;
+    let trader = create_subaccount(sandbox, "trader.sandbox").await?;
+    let usdc = deploy_mock_usdc(sandbox, network, "usdc.sandbox", &owner).await?;
+    let (machine, coin) = setup_machine(
+        sandbox,
+        network,
+        name,
+        "c.sandbox",
+        &owner,
+        usdc.account_id(),
+        VRF_PUBKEY,
     )
-    .unwrap()
+    .await?;
+    mint(network, &usdc, &owner, trader.account_id(), 100_000).await?;
+    Ok((owner, trader, usdc, machine, coin))
+}
+
+async fn machine_view(
+    network: &near_api::NetworkConfig,
+    machine: &near_api::Contract,
+) -> testresult::TestResult<serde_json::Value> {
+    Ok(machine
+        .call_function("get_machine", ())
+        .read_only()
+        .fetch_from(network)
+        .await?
+        .data)
 }
 
 #[tokio::test]
-async fn test_curve_buy_sell_math_and_fee_split() -> testresult::TestResult<()> {
-    let wasm_path = cargo_near_build::build_with_cli(cargo_near_build::BuildOpts::builder().features("unit-testing").build())?;
-    let wasm = std::fs::read(wasm_path)?;
+async fn test_curve_buy_sell_round_trip_real_balances() -> testresult::TestResult<()> {
     let sandbox = near_sandbox::Sandbox::start_sandbox().await?;
     let network = near_api::NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
+    let (_owner, trader, usdc, machine, coin) = setup(&sandbox, &network, "curve1.sandbox").await?;
 
-    let owner = create_subaccount(&sandbox, "owner.sandbox").await?;
-    let trader = create_subaccount(&sandbox, "trader.sandbox").await?;
-    let contract_acc = create_subaccount(&sandbox, "curve1.sandbox").await?.as_contract();
+    let before = machine_view(&network, &machine).await?;
+    let curve_before = u128_str(&before["curve_coin_reserve"]);
+    let quote_before = ft_balance(&network, &usdc, trader.account_id()).await?;
 
-    near_api::Contract::deploy(contract_acc.account_id().clone())
-        .use_code(wasm)
-        .with_init_call(
-            "new",
-            json!({
-                "owner": owner.account_id(),
-                "coin": "coin.sandbox",
-                "quote_token": "usdc.sandbox",
-                "prize_table": good_table(),
-                "pack_art_url": "ipfs://QmTest",
-                "vrf_pubkey": "pubkey",
-                "recharge_on": false
-            }),
-        )?
-        .max_gas()
-        .with_signer(genesis_signer())
-        .send_to(&network)
+    register_coin(&network, &coin, &trader).await?;
+    curve_buy(&network, &usdc, &trader, &machine, 1_000, None).await?;
+    sandbox.fast_forward(8).await?;
+
+    let coins = ft_balance(&network, &coin, trader.account_id()).await?;
+    assert!(coins > 0, "curve buy must transfer real coins");
+    let after_buy = machine_view(&network, &machine).await?;
+    assert_eq!(
+        u128_str(&after_buy["curve_coin_reserve"]),
+        curve_before - coins
+    );
+
+    let creator_fees: String = machine
+        .call_function("get_creator_fees", ())
+        .read_only()
+        .fetch_from(&network)
         .await?
-        .assert_success();
-
-    // buy with 10000 quote, expect ~ hand-computed coins
-    let res_buy = contract_acc
-        .call_function("curve_buy", json!({"quote_amount": "10000"}))
-        .transaction()
-        .with_signer(trader.account_id().clone(), genesis_signer())
-        .send_to(&network)
-        .await?;
-    let success = res_buy.assert_success();
-    let coins_out: u128 = {
-        let s: String = success.json().unwrap_or_else(|_| "0".to_string());
-        s.parse().unwrap_or(0)
-    };
-    assert!(coins_out > 0, "buy should give coins");
-    assert!(coins_out < 1_000_000_000_000_000, "should be less than total supply");
-
-    // check fee split: 1% of 10000 =100, split 50/50
-    let fees: String = contract_acc
+        .data;
+    let protocol_fees: String = machine
         .call_function("get_protocol_fees", ())
         .read_only()
         .fetch_from(&network)
         .await?
         .data;
-    let fee_num: u128 = fees.parse().unwrap();
-    assert_eq!(fee_num, 50, "protocol fee should be 0.5% of 10000 =50");
+    assert_eq!(creator_fees, "5");
+    assert_eq!(protocol_fees, "5");
 
-    // second buy should give fewer coins for same quote (price up)
-    let res_buy2 = contract_acc
-        .call_function("curve_buy", json!({"quote_amount": "10000"}))
-        .transaction()
-        .with_signer(trader.account_id().clone(), genesis_signer())
-        .send_to(&network)
-        .await?;
-    let success2 = res_buy2.assert_success();
-    let coins_out2: u128 = {
-        let s: String = success2.json().unwrap_or_else(|_| "0".to_string());
-        s.parse().unwrap_or(0)
-    };
-    assert!(coins_out2 < coins_out, "second buy should give fewer coins due to price increase");
+    curve_sell(&network, &coin, &trader, &machine, coins, None).await?;
+    sandbox.fast_forward(10).await?;
 
-    // sell with slippage check
-    // sell half of first buy
-    let sell_amount = (coins_out / 2).to_string();
-    let res_sell = contract_acc
-        .call_function("curve_sell", json!({"coin_amount": sell_amount, "min_quote_out": "1"}))
-        .transaction()
-        .with_signer(trader.account_id().clone(), genesis_signer())
-        .send_to(&network)
-        .await?;
-    let success_sell = res_sell.assert_success();
-    let quote_out: u128 = {
-        let s: String = success_sell.json().unwrap_or_else(|_| "0".to_string());
-        s.parse().unwrap_or(0)
-    };
-    assert!(quote_out > 0, "sell should give quote");
-
-    // slippage behavior: asking for min_quote_out too high should fail
-    let res_slip = contract_acc
-        .call_function("curve_sell", json!({"coin_amount": "1", "min_quote_out": "1000000000"}))
-        .transaction()
-        .with_signer(trader.account_id().clone(), genesis_signer())
-        .send_to(&network)
-        .await?;
-    assert!(res_slip.is_failure(), "sell with huge min_quote_out should fail slippage");
-
-    // recent_trades cap 50 - do 55 trades and check length capped
-    for _ in 0..55 {
-        contract_acc
-            .call_function("curve_buy", json!({"quote_amount": "100"}))
-            .transaction()
-            .with_signer(trader.account_id().clone(), genesis_signer())
-            .send_to(&network)
-            .await?
-            .assert_success();
-    }
-    let trades: serde_json::Value = contract_acc
-        .call_function("get_recent_trades", json!({"limit": 100}))
+    assert_eq!(ft_balance(&network, &coin, trader.account_id()).await?, 0);
+    assert!(ft_balance(&network, &usdc, trader.account_id()).await? > quote_before - 1_000);
+    let coin_fees: serde_json::Value = machine
+        .call_function("get_protocol_fees_coin", ())
         .read_only()
         .fetch_from(&network)
         .await?
         .data;
-    let len = trades.as_array().unwrap().len();
-    assert_eq!(len, 50, "recent_trades should cap at 50, got {}", len);
+    assert!(u128_str(&coin_fees) > 0);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_recharge_on_vs_off() -> testresult::TestResult<()> {
-    let wasm_path = cargo_near_build::build_with_cli(cargo_near_build::BuildOpts::builder().features("unit-testing").build())?;
-    let wasm = std::fs::read(wasm_path)?;
+async fn test_curve_buy_slippage_refunds_quote() -> testresult::TestResult<()> {
     let sandbox = near_sandbox::Sandbox::start_sandbox().await?;
     let network = near_api::NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
+    let (_owner, trader, usdc, machine, coin) = setup(&sandbox, &network, "curve2.sandbox").await?;
 
-    let owner = create_subaccount(&sandbox, "owner.sandbox").await?;
-    let trader = create_subaccount(&sandbox, "trader2.sandbox").await?;
+    let before = ft_balance(&network, &usdc, trader.account_id()).await?;
+    register_coin(&network, &coin, &trader).await?;
+    curve_buy(&network, &usdc, &trader, &machine, 1_000, Some(u128::MAX)).await?;
+    sandbox.fast_forward(8).await?;
 
-    // machine with recharge off
-    let contract_off = create_subaccount(&sandbox, "curve_off.sandbox").await?.as_contract();
-    near_api::Contract::deploy(contract_off.account_id().clone())
-        .use_code(wasm.clone())
-        .with_init_call(
-            "new",
+    assert_eq!(ft_balance(&network, &coin, trader.account_id()).await?, 0);
+    assert_eq!(
+        ft_balance(&network, &usdc, trader.account_id()).await?,
+        before
+    );
+    let view = machine_view(&network, &machine).await?;
+    assert_eq!(u128_str(&view["curve_quote_reserve"]), 100_000_000);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_curve_sell_more_than_held_reverts() -> testresult::TestResult<()> {
+    let sandbox = near_sandbox::Sandbox::start_sandbox().await?;
+    let network = near_api::NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
+    let (_owner, trader, _usdc, machine, coin) =
+        setup(&sandbox, &network, "curve3.sandbox").await?;
+
+    let res = coin
+        .call_function(
+            "ft_transfer_call",
             json!({
-                "owner": owner.account_id(),
-                "coin": "coin.sandbox",
-                "quote_token": "usdc.sandbox",
-                "prize_table": good_table(),
-                "pack_art_url": "ipfs://QmTest",
-                "vrf_pubkey": "pubkey",
-                "recharge_on": false
+                "receiver_id": machine.account_id(),
+                "amount": "1",
+                "msg": "{\"action\":\"curve_sell\"}"
             }),
-        )?
-        .max_gas()
-        .with_signer(genesis_signer())
-        .send_to(&network)
-        .await?
-        .assert_success();
-
-    contract_off
-        .call_function("curve_buy", json!({"quote_amount": "10000"}))
+        )
         .transaction()
+        .deposit(near_api::NearToken::from_yoctonear(1))
+        .gas(near_api::NearGas::from_tgas(150))
         .with_signer(trader.account_id().clone(), genesis_signer())
         .send_to(&network)
-        .await?
-        .assert_success();
+        .await?;
+    assert!(res.is_failure(), "selling more than held must revert");
 
-    let machine_off: serde_json::Value = contract_off
-        .call_function("get_machine", ())
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_curve_sell_failed_payout_restores_coins() -> testresult::TestResult<()> {
+    let sandbox = near_sandbox::Sandbox::start_sandbox().await?;
+    let network = near_api::NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
+    let (owner, trader, usdc, machine, coin) = setup(&sandbox, &network, "curve4.sandbox").await?;
+
+    register_coin(&network, &coin, &trader).await?;
+    curve_buy(&network, &usdc, &trader, &machine, 1_000, None).await?;
+    sandbox.fast_forward(8).await?;
+    let coins = ft_balance(&network, &coin, trader.account_id()).await?;
+    let before = machine_view(&network, &machine).await?;
+
+    set_fail_transfers(&network, &usdc, &owner, true).await?;
+    curve_sell(&network, &coin, &trader, &machine, coins, None).await?;
+    sandbox.fast_forward(12).await?;
+    set_fail_transfers(&network, &usdc, &owner, false).await?;
+
+    let pending: String = machine
+        .call_function(
+            "get_pending_coin_refund",
+            json!({"account": trader.account_id()}),
+        )
         .read_only()
         .fetch_from(&network)
         .await?
         .data;
-    let pool_off: u128 = machine_off["pool_balance"].as_str().unwrap().parse().unwrap();
-
-    // machine with recharge on
-    let contract_on = create_subaccount(&sandbox, "curve_on.sandbox").await?.as_contract();
-    near_api::Contract::deploy(contract_on.account_id().clone())
-        .use_code(wasm)
-        .with_init_call(
-            "new",
-            json!({
-                "owner": owner.account_id(),
-                "coin": "coin.sandbox",
-                "quote_token": "usdc.sandbox",
-                "prize_table": good_table(),
-                "pack_art_url": "ipfs://QmTest",
-                "vrf_pubkey": "pubkey",
-                "recharge_on": true
-            }),
-        )?
-        .max_gas()
-        .with_signer(genesis_signer())
-        .send_to(&network)
-        .await?
-        .assert_success();
-
-    contract_on
-        .call_function("curve_buy", json!({"quote_amount": "10000"}))
+    assert_eq!(
+        pending.parse::<u128>().unwrap(),
+        coins,
+        "failed payout is credited to the refund ledger"
+    );
+    machine
+        .call_function("claim_coin_refund", json!({}))
         .transaction()
+        .deposit(near_api::NearToken::from_yoctonear(1))
+        .gas(near_api::NearGas::from_tgas(150))
         .with_signer(trader.account_id().clone(), genesis_signer())
         .send_to(&network)
         .await?
         .assert_success();
+    sandbox.fast_forward(8).await?;
+    let seller_coins = ft_balance(&network, &coin, trader.account_id()).await?;
+    let after = machine_view(&network, &machine).await?;
+    assert_eq!(
+        seller_coins, coins,
+        "failed quote payout must restore the coins"
+    );
+    assert_eq!(after["curve_coin_reserve"], before["curve_coin_reserve"]);
+    assert_eq!(after["curve_quote_reserve"], before["curve_quote_reserve"]);
 
-    let machine_on: serde_json::Value = contract_on
-        .call_function("get_machine", ())
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_curve_price_rises_across_buys() -> testresult::TestResult<()> {
+    let sandbox = near_sandbox::Sandbox::start_sandbox().await?;
+    let network = near_api::NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
+    let (_owner, trader, usdc, machine, coin) = setup(&sandbox, &network, "curve5.sandbox").await?;
+
+    register_coin(&network, &coin, &trader).await?;
+    curve_buy(&network, &usdc, &trader, &machine, 1_000, None).await?;
+    sandbox.fast_forward(8).await?;
+    let first = u128_str(&machine_view(&network, &machine).await?["curve_quote_reserve"]);
+    register_coin(&network, &coin, &trader).await?;
+    curve_buy(&network, &usdc, &trader, &machine, 1_000, None).await?;
+    sandbox.fast_forward(8).await?;
+    let second = u128_str(&machine_view(&network, &machine).await?["curve_quote_reserve"]);
+    assert!(second > first, "price must rise across consecutive buys");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_interleaved_buy_failure_keeps_reserves() -> testresult::TestResult<()> {
+    let sandbox = near_sandbox::Sandbox::start_sandbox().await?;
+    let network = near_api::NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
+    let (owner, trader_a, usdc, machine, coin) =
+        setup(&sandbox, &network, "curve6.sandbox").await?;
+    let trader_b = create_subaccount(&sandbox, "trader_b.sandbox").await?;
+    mint(&network, &usdc, &owner, trader_a.account_id(), 10_000).await?;
+    mint(&network, &usdc, &owner, trader_b.account_id(), 10_000).await?;
+
+    // A is registered for the quote but not for the coin, so its payout fails
+    register(&network, &machine, &trader_a).await?;
+    register_coin(&network, &coin, &trader_b).await?;
+    register(&network, &machine, &trader_b).await?;
+
+    let before = machine_view(&network, &machine).await?;
+    let before_quote = u128_str(&before["curve_quote_reserve"]);
+    let before_coin = u128_str(&before["curve_coin_reserve"]);
+
+    curve_buy(&network, &usdc, &trader_a, &machine, 1_000, None).await?;
+    curve_buy(&network, &usdc, &trader_b, &machine, 1_000, None).await?;
+    sandbox.fast_forward(12).await?;
+
+    let b_coins = ft_balance(&network, &coin, trader_b.account_id()).await?;
+    let after = machine_view(&network, &machine).await?;
+    assert_eq!(
+        u128_str(&after["curve_quote_reserve"]),
+        before_quote + 990,
+        "only B's net quote is committed"
+    );
+    assert_eq!(
+        u128_str(&after["curve_coin_reserve"]),
+        before_coin - b_coins,
+        "only B's coins leave the curve"
+    );
+
+    let refund: String = machine
+        .call_function(
+            "get_pending_refund",
+            json!({"account": trader_a.account_id()}),
+        )
         .read_only()
         .fetch_from(&network)
         .await?
         .data;
-    let pool_on: u128 = machine_on["pool_balance"].as_str().unwrap().parse().unwrap();
+    assert_eq!(refund, "1000", "the failed buyer is refunded in full");
+    assert_eq!(ft_balance(&network, &coin, trader_a.account_id()).await?, 0);
 
-    // with recharge on, pool_balance should be greater (creator fee bought coins into pool)
-    // pool_off is 0 (no seed, no recharge), pool_on should be >0
-    assert!(pool_on > pool_off, "recharge on should increase pool_balance: off {} on {}", pool_off, pool_on);
+    Ok(())
+}
 
-    // creator fees: off should have 50, on should have 0 (since fee goes to pool)
-    // We can't directly check creator_fees via view, but we can infer from total fees logic
-    // For simplicity check that off machine has pool_balance 0, on has >0
+#[tokio::test]
+async fn test_ten_parallel_buys_keep_accounting() -> testresult::TestResult<()> {
+    let sandbox = near_sandbox::Sandbox::start_sandbox().await?;
+    let network = near_api::NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
+    let (owner, first, usdc, machine, coin) = setup(&sandbox, &network, "curve7.sandbox").await?;
+    let mut traders = vec![first];
+    for i in 0..9 {
+        let trader = create_subaccount(&sandbox, &format!("p{}.sandbox", i)).await?;
+        traders.push(trader);
+    }
+    for trader in &traders {
+        mint(&network, &usdc, &owner, trader.account_id(), 10_000).await?;
+        register_coin(&network, &coin, trader).await?;
+        register(&network, &machine, trader).await?;
+    }
+
+    let before = machine_view(&network, &machine).await?;
+    let before_quote = u128_str(&before["curve_quote_reserve"]);
+    let before_coin = u128_str(&before["curve_coin_reserve"]);
+
+    for trader in &traders {
+        curve_buy(&network, &usdc, trader, &machine, 1_000, None).await?;
+    }
+    sandbox.fast_forward(20).await?;
+
+    let mut total_coins = 0u128;
+    for trader in &traders {
+        total_coins += ft_balance(&network, &coin, trader.account_id()).await?;
+    }
+    let after = machine_view(&network, &machine).await?;
+    assert_eq!(
+        u128_str(&after["curve_quote_reserve"]),
+        before_quote + 9_900,
+        "each buy commits its net quote"
+    );
+    assert_eq!(
+        u128_str(&after["curve_coin_reserve"]),
+        before_coin - total_coins,
+        "the coin reserve matches the actual payouts"
+    );
 
     Ok(())
 }
